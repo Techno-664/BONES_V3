@@ -1,0 +1,5 @@
+uv sync
+python -m bones generate_splits
+python -m bones train
+python -m bones evaluate
+python -m bones predict

@@ -1,0 +1,13 @@
+{
+  "split": "fold_1_val",
+  "image_ids": [
+    "W06_Control_001",
+    "W06_GelLaser_001",
+    "W06_Gel_002",
+    "W06_Laser_002",
+    "W12_Control_004",
+    "W12_GelLaser_004",
+    "W12_Gel_005",
+    "W12_Laser_001"
+  ]
+}

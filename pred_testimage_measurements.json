@@ -1,0 +1,8 @@
+{
+  "fracture_gap": {
+    "min_width_px": 4.47,
+    "max_width_px": 18.11,
+    "mean_width_px": 12.13
+  },
+  "callus_ratio": 0.0151
+}
