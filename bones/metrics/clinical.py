@@ -64,6 +64,12 @@ def compute_measurements(predictions: dict[str, Any], categories: dict[int, str]
     if fracture_mask is not None:
         result["fracture_gap"] = fracture_gap_width(fracture_mask)
 
+    if fracture_mask is not None and bone_mask_arr is not None:
+        gap_area = float(fracture_mask.sum())
+        bone_area = float(bone_mask_arr.sum())
+        if bone_area > 0:
+            result["healing_ratio"] = round(1.0 - gap_area / bone_area, 4)
+
     if callus_mask_arr is not None and bone_mask_arr is not None:
         result["callus_ratio"] = callus_ratio(callus_mask_arr, bone_mask_arr)
     elif callus_mask_arr is not None:
