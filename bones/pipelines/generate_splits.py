@@ -6,15 +6,15 @@ from pathlib import Path
 from sklearn.model_selection import StratifiedKFold
 
 from bones.config import (
-    FOLDS_DIR,
-    RANDOM_STATE,
-    N_FOLDS,
     DATASET_DIR,
-    WEEKS,
+    FOLDS_DIR,
+    N_FOLDS,
+    RANDOM_STATE,
     TREATMENTS,
+    WEEKS,
 )
-from bones.logging import setup_logger
 from bones.data.builders import stem_prefix
+from bones.logging import setup_logger
 
 log = setup_logger("generate_splits")
 
@@ -30,7 +30,7 @@ def main() -> int:
             if not json_path.exists():
                 continue
 
-            with open(json_path, "r") as f:
+            with open(json_path) as f:
                 data = json.load(f)
 
             label = f"{week}_{treatment}"

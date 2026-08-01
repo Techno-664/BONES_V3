@@ -27,9 +27,8 @@ def main() -> int:
     elif command == "generate_splits":
         from bones.pipelines.generate_splits import main as generate_splits_main
         return generate_splits_main()
-    else:
-        log.error("Unknown command: %s", command)
-        return 1
+    log.error("Unknown command: %s", command)
+    return 1
 
 
 if __name__ == "__main__":

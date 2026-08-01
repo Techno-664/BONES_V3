@@ -4,6 +4,7 @@ from pathlib import Path
 
 import cv2
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -30,14 +31,14 @@ def plot_pr_curves(
         class_names = _class_names()
     fig, ax = plt.subplots(figsize=(8, 6))
     for cid, data in pr_curves.items():
-        prec = data.get("precision", [])
-        rec = data.get("recall", [])
-        if not prec or not rec:
+        precision = data.get("precision", [])
+        recall = data.get("recall", [])
+        if not precision or not recall:
             continue
         name = class_names[cid - 1] if cid - 1 < len(class_names) else str(cid)
-        ap = data.get("ap_50", None)
+        ap = data.get("AP_50", None)
         label = f"{name} (AP={ap:.3f})" if ap else name
-        ax.plot(rec, prec, label=label, lw=2)
+        ax.plot(recall, precision, label=label, lw=2)
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
     ax.set_title("Precision-Recall Curves")
@@ -50,7 +51,7 @@ def plot_pr_curves(
     plt.close(fig)
 
 
-def plot_ap_barchart(
+def plot_ap_bar_chart(
     per_class_ap: dict[int, dict],
     save_path: str,
     class_names: list[str] | None = None,
@@ -60,13 +61,13 @@ def plot_ap_barchart(
     cids = sorted(per_class_ap.keys())
     names = [class_names[cid - 1] if cid - 1 < len(class_names) else str(cid) for cid in cids]
     ap50 = [per_class_ap[cid].get("AP_50", 0.0) for cid in cids]
-    ap5095 = [per_class_ap[cid].get("AP_50_95", 0.0) for cid in cids]
+    ap_50_95 = [per_class_ap[cid].get("AP_50_95", 0.0) for cid in cids]
 
     x = np.arange(len(names))
     w = 0.35
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.bar(x - w / 2, ap50, w, label="AP@0.5")
-    ax.bar(x + w / 2, ap5095, w, label="AP@0.5:0.95")
+    ax.bar(x + w / 2, ap_50_95, w, label="AP@0.5:0.95")
     ax.set_xticks(x)
     ax.set_xticklabels(names)
     ax.set_ylabel("Average Precision")
@@ -75,7 +76,7 @@ def plot_ap_barchart(
     ax.set_ylim(0, 1)
     for i in range(len(cids)):
         ax.text(i - w / 2, ap50[i] + 0.02, f"{ap50[i]:.3f}", ha="center", va="bottom", fontsize=8)
-        ax.text(i + w / 2, ap5095[i] + 0.02, f"{ap5095[i]:.3f}", ha="center", va="bottom", fontsize=8)
+        ax.text(i + w / 2, ap_50_95[i] + 0.02, f"{ap_50_95[i]:.3f}", ha="center", va="bottom", fontsize=8)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
@@ -90,16 +91,16 @@ def plot_f1_vs_threshold(
         class_names = _class_names()
     fig, ax = plt.subplots(figsize=(8, 6))
     for cid, data in f1_data.items():
-        thresh = data.get("thresholds", [])
+        thresholds = data.get("thresholds", [])
         f1 = data.get("f1_scores", [])
-        if not thresh or not f1:
+        if not thresholds or not f1:
             continue
         name = class_names[cid - 1] if cid - 1 < len(class_names) else str(cid)
-        ax.plot(thresh, f1, label=name, lw=2)
+        ax.plot(thresholds, f1, label=name, lw=2)
         best_idx = int(np.argmax(f1))
-        ax.plot(thresh[best_idx], f1[best_idx], "o", markersize=8)
-        ax.annotate(f"{f1[best_idx]:.3f} @ {thresh[best_idx]:.2f}",
-                     (thresh[best_idx], f1[best_idx]),
+        ax.plot(thresholds[best_idx], f1[best_idx], "o", markersize=8)
+        ax.annotate(f"{f1[best_idx]:.3f} @ {thresholds[best_idx]:.2f}",
+                     (thresholds[best_idx], f1[best_idx]),
                      textcoords="offset points", xytext=(5, 5), fontsize=8)
     ax.set_xlabel("Confidence Threshold")
     ax.set_ylabel("F1-Score")
@@ -288,7 +289,10 @@ def plot_overlay_grid(
         pred_scores = output["scores"].cpu().numpy() if hasattr(output["scores"], "cpu") else np.array(output["scores"])
 
         gt_disp = _draw_overlay(img_np, gt_masks, gt_boxes, gt_labels, None, class_names, (0, 180, 0))
-        pred_disp = _draw_overlay(img_np, pred_masks, pred_boxes, pred_labels, pred_scores, class_names, (0, 0, 220), score_threshold)
+        pred_disp = _draw_overlay(
+            img_np, pred_masks, pred_boxes, pred_labels,
+            pred_scores, class_names, (0, 0, 220), score_threshold,
+        )
         combined = np.concatenate([gt_disp, pred_disp], axis=1)
         axes[idx].imshow(cv2.cvtColor(combined, cv2.COLOR_BGR2RGB))
         axes[idx].axis("off")
@@ -339,7 +343,10 @@ def plot_failure_cases(
         pred_scores = output["scores"].cpu().numpy() if hasattr(output["scores"], "cpu") else np.array(output["scores"])
 
         gt_disp = _draw_overlay(img_np, gt_masks, gt_boxes, gt_labels, None, class_names, (0, 180, 0))
-        pred_disp = _draw_overlay(img_np, pred_masks, pred_boxes, pred_labels, pred_scores, class_names, (0, 0, 220), score_threshold)
+        pred_disp = _draw_overlay(
+            img_np, pred_masks, pred_boxes, pred_labels,
+            pred_scores, class_names, (0, 0, 220), score_threshold,
+        )
         combined = np.concatenate([gt_disp, pred_disp], axis=1)
         axes[idx].imshow(cv2.cvtColor(combined, cv2.COLOR_BGR2RGB))
         axes[idx].axis("off")
@@ -348,6 +355,45 @@ def plot_failure_cases(
     for idx in range(len(worst_indices), len(axes)):
         axes[idx].axis("off")
 
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_roc_curves(
+    roc_data: dict[int, dict],
+    save_path: str,
+    class_names: list[str] | None = None,
+):
+    if class_names is None:
+        class_names = _class_names()
+    fig, ax = plt.subplots(figsize=(8, 6))
+    grid = np.linspace(0.0, 1.0, 101)
+    macro_tprs = []
+    for cid, data in roc_data.items():
+        tpr = data.get("tpr", [])
+        fpr = data.get("fpr", [])
+        if not tpr or not fpr:
+            continue
+        name = class_names[cid - 1] if cid - 1 < len(class_names) else str(cid)
+        auc = data.get("auc", 0.0)
+        ax.plot(fpr, tpr, lw=2, label=f"{name} (AUC={auc:.3f})")
+        macro_tprs.append(np.interp(grid, fpr, tpr))
+    if macro_tprs:
+        mean_tpr = np.mean(macro_tprs, axis=0)
+        mean_tpr[0] = 0.0
+        mean_tpr[-1] = 1.0
+        macro_auc = float(np.trapezoid(mean_tpr, grid))
+        ax.plot(grid, mean_tpr, "--", lw=2, color="black",
+                label=f"Macro-average (AUC={macro_auc:.3f})")
+    ax.plot([0, 1], [0, 1], ls=":", lw=1, color="gray", label="Chance")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curves")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.legend(loc="lower right")
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
@@ -404,7 +450,7 @@ def save_all_figures(
 
     per_class_ap = eval_data.get("per_class_ap", {})
     if per_class_ap:
-        plot_ap_barchart(per_class_ap, str(save_path / "ap_barchart.png"), class_names)
+        plot_ap_bar_chart(per_class_ap, str(save_path / "ap_bar_chart.png"), class_names)
 
     f1_data = eval_data.get("f1_data", {})
     if f1_data:
@@ -417,6 +463,10 @@ def save_all_figures(
     tide_data = eval_data.get("tide_data", {})
     if tide_data:
         plot_tide_errors(tide_data, str(save_path / "tide_errors.png"), class_names)
+
+    roc_data = metrics.get("roc_curves")
+    if roc_data:
+        plot_roc_curves(roc_data, str(save_path / "roc_curves.png"), class_names)
 
     ious = eval_data.get("matched_ious_per_class", {})
     if ious:

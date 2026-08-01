@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import torch
-from torchvision.models.detection import maskrcnn_resnet50_fpn
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
+from torchvision.models.detection import (
+    faster_rcnn,
+    mask_rcnn,
+    maskrcnn_resnet50_fpn,  # noqa: SC100
+)
 
 from bones.config import MODEL
 
@@ -31,11 +33,11 @@ def build_mask_rcnn(num_classes: int | None = None, class_weights: list[float] |
     model = maskrcnn_resnet50_fpn(weights=weights)
 
     in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    model.roi_heads.box_predictor = faster_rcnn.FastRCNNPredictor(in_features, num_classes)
 
-    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
+    in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels  # type: ignore[union-attr]
     hidden_layer = 256
-    model.roi_heads.mask_predictor = MaskRCNNPredictor(
+    model.roi_heads.mask_predictor = mask_rcnn.MaskRCNNPredictor(
         in_features_mask, hidden_layer, num_classes
     )
 

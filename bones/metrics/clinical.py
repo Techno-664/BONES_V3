@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
-from skimage.morphology import skeletonize
 from scipy.ndimage import distance_transform_edt
+from skimage.morphology import skeletonize
 
 from bones.config import MASK_THRESHOLD
 
@@ -31,25 +33,24 @@ def fracture_gap_width(mask: np.ndarray) -> dict[str, float]:
 
 def callus_ratio(callus_mask: np.ndarray, bone_mask: np.ndarray) -> float:
     bone_area = float(bone_mask.sum())
-    if bone_area == 0:
-        return 0.0
-    return round(float(callus_mask.sum()) / bone_area, 4)
+    if bone_area > 0:
+        return round(float(callus_mask.sum()) / bone_area, 4)
+    return 0.0
 
 
-def compute_measurements(predictions: dict, categories: dict[int, str]) -> dict:
-    masks = predictions.get("masks")
-    labels = predictions.get("labels")
-    scores = predictions.get("scores")
-
-    if masks is None or labels is None:
+def compute_measurements(predictions: dict[str, Any], categories: dict[int, str]) -> dict[str, Any]:
+    if "masks" not in predictions or "labels" not in predictions or "scores" not in predictions:
         return {}
 
-    result = {}
-    fracture_mask = None
-    callus_mask_arr = None
-    bone_mask_arr = None
+    masks: np.ndarray = predictions["masks"]
+    labels: np.ndarray = predictions["labels"]
 
-    for i in range(len(scores)):
+    result: dict[str, Any] = {}
+    fracture_mask: np.ndarray | None = None
+    callus_mask_arr: np.ndarray | None = None
+    bone_mask_arr: np.ndarray | None = None
+
+    for i in range(len(labels)):
         cat_name = categories.get(int(labels[i]), "")
         mask = (masks[i, 0] > MASK_THRESHOLD).astype(np.uint8)
 

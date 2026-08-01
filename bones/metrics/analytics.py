@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import torch
 
@@ -11,18 +13,45 @@ def _iou_matrix_from_lists(
     pred_masks: list[np.ndarray],
 ) -> np.ndarray:
     all_masks = gt_masks + pred_masks
-    h = max(m.shape[0] for m in all_masks)
-    w = max(m.shape[1] for m in all_masks)
+    target_h = max(m.shape[0] for m in all_masks)
+    target_w = max(m.shape[1] for m in all_masks)
 
-    def _resize(mask, h, w):
-        if mask.shape == (h, w):
+    def _resize(mask: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+        if mask.shape == (out_h, out_w):
             return mask
         t = torch.from_numpy(mask.astype(float)).unsqueeze(0).unsqueeze(0)
-        return torch.nn.functional.interpolate(t, size=(h, w), mode="nearest").squeeze().numpy().astype(np.uint8)
+        interp = torch.nn.functional.interpolate(t, size=(out_h, out_w), mode="nearest")
+        return interp.squeeze().numpy().astype(np.uint8)
 
-    gt_t = torch.from_numpy(np.stack([_resize(m, h, w) for m in gt_masks], axis=0))
-    pred_t = torch.from_numpy(np.stack([_resize(m, h, w) for m in pred_masks], axis=0))
+    gt_t = torch.from_numpy(np.stack([_resize(m, target_h, target_w) for m in gt_masks], axis=0))
+    pred_t = torch.from_numpy(np.stack([_resize(m, target_h, target_w) for m in pred_masks], axis=0))
     return compute_iou_matrix(gt_t, pred_t)
+
+
+def _greedy_match(
+    iou_matrix: np.ndarray,
+    gt_matched: np.ndarray,
+    pred_matched: np.ndarray,
+    iou_threshold: float,
+) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    while True:
+        available = iou_matrix[~gt_matched][:, ~pred_matched]
+        if not available.size:
+            break
+        max_iou = float(available.max())
+        if max_iou < iou_threshold:
+            break
+        flat_max = int(available.argmax())
+        n_col = available.shape[1]
+        gi_rel = flat_max // n_col
+        pi_rel = flat_max % n_col
+        gi = int(np.where(~gt_matched)[0][gi_rel])
+        pi = int(np.where(~pred_matched)[0][pi_rel])
+        gt_matched[gi] = True
+        pred_matched[pi] = True
+        pairs.append((gi, pi))
+    return pairs
 
 
 def compute_ap(recall: np.ndarray, precision: np.ndarray) -> float:
@@ -36,7 +65,7 @@ def compute_ap(recall: np.ndarray, precision: np.ndarray) -> float:
     return float(((recall[idx + 1] - recall[idx]) * precision[idx + 1]).sum())
 
 
-def compute_mAP(
+def compute_map(
     pred_masks: list[np.ndarray],
     gt_masks: list[np.ndarray],
     pred_scores: list[float],
@@ -45,12 +74,13 @@ def compute_mAP(
     class_ids: list[int],
     iou_thresholds: list[float] | None = None,
     return_details: bool = False,
-) -> dict:
+) -> dict[str, Any]:
     if iou_thresholds is None:
         iou_thresholds = [round(0.5 + 0.05 * i, 2) for i in range(10)]
 
     n_gt = len(gt_masks)
     n_pred = len(pred_masks)
+    result: dict[str, Any]
     if n_gt == 0 or n_pred == 0:
         result = {"mAP_50": 0.0, "mAP_50_95": 0.0}
         if return_details:
@@ -60,11 +90,11 @@ def compute_mAP(
 
     iou_matrix = _iou_matrix_from_lists(gt_masks, pred_masks)
 
-    aps = []
-    per_class_ap = {cid: {"AP_50": 0.0, "AP_50_95": 0.0} for cid in class_ids}
-    pr_curves: dict = {}
+    aps: list[float] = []
+    per_class_ap: dict[int, dict[str, float]] = {cid: {"AP_50": 0.0, "AP_50_95": 0.0} for cid in class_ids}
+    pr_curves: dict[int, dict[str, Any]] = {}
 
-    for iou_thresh in iou_thresholds:
+    for iou_threshold in iou_thresholds:
         class_aps = []
         for cid in class_ids:
             gt_idx = [i for i, l in enumerate(gt_labels) if l == cid]
@@ -73,11 +103,11 @@ def compute_mAP(
                 continue
             if not pred_idx:
                 class_aps.append(0.0)
-                if iou_thresh == iou_thresholds[0]:
+                if iou_threshold == iou_thresholds[0]:
                     per_class_ap[cid]["AP_50"] = 0.0
                 continue
 
-            matches = iou_matrix[np.ix_(gt_idx, pred_idx)] >= iou_thresh
+            matches = iou_matrix[np.ix_(gt_idx, pred_idx)] >= iou_threshold
             gt_matched = np.zeros(len(gt_idx), dtype=bool)
             pred_matched = np.zeros(len(pred_idx), dtype=bool)
 
@@ -103,7 +133,7 @@ def compute_mAP(
             ap = compute_ap(recall, precision)
             class_aps.append(ap)
 
-            if return_details and iou_thresh == iou_thresholds[0]:
+            if return_details and iou_threshold == iou_thresholds[0]:
                 per_class_ap[cid]["AP_50"] = round(ap, 4)
                 pr_curves[cid] = {
                     "precision": [round(float(p), 4) for p in precision],
@@ -114,9 +144,9 @@ def compute_mAP(
         if class_aps:
             aps.append(float(np.mean(class_aps)))
 
-    mAP_50 = aps[0] if len(aps) > 0 else 0.0
-    mAP_50_95 = float(np.mean(aps)) if aps else 0.0
-    result = {"mAP_50": round(mAP_50, 4), "mAP_50_95": round(mAP_50_95, 4)}
+    map_50 = aps[0] if len(aps) > 0 else 0.0
+    map_50_95 = float(np.mean(aps)) if aps else 0.0
+    result = {"mAP_50": round(map_50, 4), "mAP_50_95": round(map_50_95, 4)}
     if return_details:
         result["per_class_ap"] = per_class_ap
         result["pr_curves"] = pr_curves
@@ -132,11 +162,11 @@ def compute_f1_vs_threshold(
     class_ids: list[int],
     iou_threshold: float = 0.5,
     step: float = 0.05,
-) -> dict:
+) -> dict[int, Any]:
     n_gt = len(gt_masks)
     n_pred = len(pred_masks)
     thresholds = np.arange(step, 1.0, step)
-    result: dict = {}
+    result: dict[int, Any] = {}
 
     if n_gt == 0 or n_pred == 0:
         for cid in class_ids:
@@ -153,35 +183,23 @@ def compute_f1_vs_threshold(
             continue
 
         f1_vals = []
-        prec_vals = []
-        rec_vals = []
+        precision_vals = []
+        recall_vals = []
 
-        for thresh in thresholds:
-            pred_idx = [j for j in pred_idx_all if pred_scores[j] >= thresh]
+        for threshold in thresholds:
+            pred_idx = [j for j in pred_idx_all if pred_scores[j] >= threshold]
             if not pred_idx:
                 f1_vals.append(0.0)
-                prec_vals.append(0.0)
-                rec_vals.append(0.0)
+                precision_vals.append(0.0)
+                recall_vals.append(0.0)
                 continue
 
             sub = iou_matrix[np.ix_(gt_idx, pred_idx)]
             gt_m = np.zeros(len(gt_idx), dtype=bool)
             pred_m = np.zeros(len(pred_idx), dtype=bool)
-            tp = 0
 
-            while True:
-                max_iou = float(sub[~gt_m][:, ~pred_m].max()) if (~gt_m).any() and (~pred_m).any() else 0.0
-                if max_iou < iou_threshold:
-                    break
-                flat = sub[~gt_m][:, ~pred_m].argmax()
-                n_col = sub[~gt_m][:, ~pred_m].shape[1]
-                gi_rel = flat // n_col
-                pi_rel = flat % n_col
-                gi = np.where(~gt_m)[0][gi_rel]
-                pi = np.where(~pred_m)[0][pi_rel]
-                gt_m[gi] = True
-                pred_m[pi] = True
-                tp += 1
+            pairs = _greedy_match(sub, gt_m, pred_m, iou_threshold)
+            tp = len(pairs)
 
             fp = len(pred_idx) - tp
             fn = len(gt_idx) - tp
@@ -189,14 +207,14 @@ def compute_f1_vs_threshold(
             r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
             f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
             f1_vals.append(round(f1, 4))
-            prec_vals.append(round(p, 4))
-            rec_vals.append(round(r, 4))
+            precision_vals.append(round(p, 4))
+            recall_vals.append(round(r, 4))
 
         result[cid] = {
             "thresholds": [round(float(t), 2) for t in thresholds],
             "f1_scores": f1_vals,
-            "precisions": prec_vals,
-            "recalls": rec_vals,
+            "precisions": precision_vals,
+            "recalls": recall_vals,
         }
 
     return result
@@ -208,8 +226,8 @@ def confusion_matrix(
     pred_labels: list[int],
     gt_labels: list[int],
     class_ids: list[int],
-    iou_thresh: float = 0.5,
-) -> dict:
+    iou_threshold: float = 0.5,
+) -> dict[str, Any]:
     n_gt = len(gt_masks)
     n_pred = len(pred_masks)
 
@@ -225,19 +243,8 @@ def confusion_matrix(
     gt_matched = np.zeros(n_gt, dtype=bool)
     pred_matched = np.zeros(n_pred, dtype=bool)
 
-    while True:
-        max_iou = float(iou_matrix[~gt_matched][:, ~pred_matched].max()) if (~gt_matched).any() and (~pred_matched).any() else 0.0
-        if max_iou < iou_thresh:
-            break
-        sub = iou_matrix[~gt_matched][:, ~pred_matched]
-        flat_max = sub.argmax()
-        n_avail_pred = sub.shape[1]
-        gi_rel = flat_max // n_avail_pred
-        pi_rel = flat_max % n_avail_pred
-        gi = np.where(~gt_matched)[0][gi_rel]
-        pi = np.where(~pred_matched)[0][pi_rel]
-        gt_matched[gi] = True
-        pred_matched[pi] = True
+    pairs = _greedy_match(iou_matrix, gt_matched, pred_matched, iou_threshold)
+    for gi, pi in pairs:
         cm[cmap[gt_labels[gi]], cmap[pred_labels[pi]]] += 1
 
     for gi, matched in enumerate(gt_matched):
@@ -254,16 +261,17 @@ def confusion_matrix(
 def compute_tide_errors(
     pred_masks: list[np.ndarray],
     gt_masks: list[np.ndarray],
-    pred_scores: list[float],
     pred_labels: list[int],
     gt_labels: list[int],
     class_ids: list[int],
     iou_threshold: float = 0.5,
-) -> dict:
+) -> dict[int, dict[str, int]]:
     n_gt = len(gt_masks)
     n_pred = len(pred_masks)
-    cmap = {cid: i for i, cid in enumerate(class_ids)}
-    error_counts = {cid: {"class_error": 0, "loc_error": 0, "background_fp": 0, "missed_gt": 0} for cid in class_ids}
+    error_counts: dict[int, dict[str, int]] = {
+        cid: {"class_error": 0, "loc_error": 0, "background_fp": 0, "missed_gt": 0}
+        for cid in class_ids
+    }
 
     if n_gt == 0:
         for cid in class_ids:
@@ -280,19 +288,8 @@ def compute_tide_errors(
     pred_matched = np.zeros(n_pred, dtype=bool)
     pred_to_gt: dict[int, int] = {}
 
-    while True:
-        max_iou = float(iou_matrix[~gt_matched][:, ~pred_matched].max()) if (~gt_matched).any() and (~pred_matched).any() else 0.0
-        if max_iou < iou_threshold:
-            break
-        sub = iou_matrix[~gt_matched][:, ~pred_matched]
-        flat_max = sub.argmax()
-        n_avail_pred = sub.shape[1]
-        gi_rel = flat_max // n_avail_pred
-        pi_rel = flat_max % n_avail_pred
-        gi = np.where(~gt_matched)[0][gi_rel]
-        pi = np.where(~pred_matched)[0][pi_rel]
-        gt_matched[gi] = True
-        pred_matched[pi] = True
+    pairs = _greedy_match(iou_matrix, gt_matched, pred_matched, iou_threshold)
+    for gi, pi in pairs:
         pred_to_gt[pi] = gi
 
     for pi in range(n_pred):
@@ -313,27 +310,36 @@ def compute_tide_errors(
     return error_counts
 
 
-def sensitivity_specificity(cm: dict) -> dict:
-    matrix = np.array(cm["matrix"])
+def sensitivity_specificity(cm: dict[str, Any]) -> dict[str, Any]:
+    matrix = np.array(cm["matrix"], dtype=int)
     class_ids = cm["class_ids"]
     n = len(class_ids)
 
-    results = {}
+    results: dict[str, Any] = {}
     for i, cid in enumerate(class_ids):
+        row = matrix[i, :n].sum()
+        col = matrix[:n, i].sum()
+        total = matrix[:n, :n].sum()
+
         tp = int(matrix[i, i])
-        fn = int(matrix[i, :n].sum()) + int(matrix[i, n]) - tp
-        fp = int(matrix[:n, i].sum()) + int(matrix[n, i]) - tp
-        total = int(matrix[:n, :n].sum())
-        tn = total - tp - fn - fp
+        fn = int(row) + int(matrix[i, n]) - tp
+        fp = int(col) + int(matrix[n, i]) - tp
+        tn = int(total) - tp - fn - fp
 
         tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
         tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
         ppv = tp / (tp + fp) if (tp + fp) > 0 else 0.0
         npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0.0
+        far = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+        frr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
 
-        results[int(cid)] = {
+        results[str(cid)] = {
             "sensitivity": round(float(tpr), 4),
             "specificity": round(float(tnr), 4),
+            "accuracy": round(float(accuracy), 4),
+            "far": round(float(far), 4),
+            "frr": round(float(frr), 4),
             "ppv": round(float(ppv), 4),
             "npv": round(float(npv), 4),
             "tp": tp, "fn": fn, "fp": fp, "tn": tn,
@@ -343,19 +349,32 @@ def sensitivity_specificity(cm: dict) -> dict:
     fn_sum = sum(r["fn"] for r in results.values())
     fp_sum = sum(r["fp"] for r in results.values())
     tn_sum = sum(r["tn"] for r in results.values())
+    total_sum = tp_sum + tn_sum + fp_sum + fn_sum
 
     macro_tpr = float(np.mean([r["sensitivity"] for r in results.values()]))
     macro_tnr = float(np.mean([r["specificity"] for r in results.values()]))
+    macro_acc = float(np.mean([r["accuracy"] for r in results.values()]))
+    macro_far = float(np.mean([r["far"] for r in results.values()]))
+    macro_frr = float(np.mean([r["frr"] for r in results.values()]))
     micro_tpr = tp_sum / (tp_sum + fn_sum) if (tp_sum + fn_sum) > 0 else 0.0
     micro_tnr = tn_sum / (tn_sum + fp_sum) if (tn_sum + fp_sum) > 0 else 0.0
+    micro_acc = (tp_sum + tn_sum) / total_sum if total_sum > 0 else 0.0
+    micro_far = fp_sum / (fp_sum + tn_sum) if (fp_sum + tn_sum) > 0 else 0.0
+    micro_frr = fn_sum / (fn_sum + tp_sum) if (fn_sum + tp_sum) > 0 else 0.0
 
     results["macro_avg"] = {
         "sensitivity": round(macro_tpr, 4),
         "specificity": round(macro_tnr, 4),
+        "accuracy": round(macro_acc, 4),
+        "far": round(macro_far, 4),
+        "frr": round(macro_frr, 4),
     }
     results["micro_avg"] = {
-        "sensitivity": round(float(micro_tpr), 4),
-        "specificity": round(float(micro_tnr), 4),
+        "sensitivity": round(micro_tpr, 4),
+        "specificity": round(micro_tnr, 4),
+        "accuracy": round(micro_acc, 4),
+        "far": round(micro_far, 4),
+        "frr": round(micro_frr, 4),
     }
 
     return results
@@ -366,8 +385,8 @@ def multiclass_auc_roc(
     all_label_dicts: list[dict[int, int]],
     class_ids: list[int],
     return_curve: bool = False,
-) -> dict:
-    results = {}
+) -> dict[int, Any]:
+    results: dict[int, Any] = {}
     for cid in class_ids:
         y_true = [ld[cid] for ld in all_label_dicts]
         y_score = [s.get(cid, 0.0) for s in all_scores]
@@ -375,7 +394,7 @@ def multiclass_auc_roc(
         n_pos = sum(y_true)
         n_neg = len(y_true) - n_pos
         if n_pos == 0 or n_neg == 0:
-            entry: dict = {"auc": 0.0}
+            entry: dict[str, Any] = {"auc": 0.0}
             if return_curve:
                 entry["tpr"] = []
                 entry["fpr"] = []
@@ -387,7 +406,7 @@ def multiclass_auc_roc(
         fpr_list = [0.0]
         tp = 0
         fp = 0
-        for _, (score, true) in enumerate(pairs):
+        for score, true in pairs:
             if true == 1:
                 tp += 1
             else:

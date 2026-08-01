@@ -12,7 +12,12 @@ def _prompt_raw(msg: str, default: Any = None) -> str:
     return raw
 
 
-def prompt_int(msg: str, default: int | None = None, min_val: int | None = None, max_val: int | None = None) -> int | None:
+def prompt_int(
+    msg: str,
+    default: int | None = None,
+    min_val: int | None = None,
+    max_val: int | None = None,
+) -> int | None:
     while True:
         raw = _prompt_raw(msg, default)
         if not raw:
@@ -31,7 +36,12 @@ def prompt_int(msg: str, default: int | None = None, min_val: int | None = None,
         return val
 
 
-def prompt_float(msg: str, default: float | None = None, min_val: float | None = None, max_val: float | None = None) -> float:
+def prompt_float(
+    msg: str,
+    default: float | None = None,
+    min_val: float | None = None,
+    max_val: float | None = None,
+) -> float:
     while True:
         raw = _prompt_raw(msg, default)
         if not raw and default is not None:
@@ -59,12 +69,10 @@ def prompt_choice(msg: str, options: dict[str, str], default: str | None = None)
         raw = _prompt_raw("Enter number", default)
         if not raw and default is not None:
             return default
-        try:
+        if raw.isdigit():
             idx = int(raw) - 1
             if 0 <= idx < len(keys):
                 return keys[idx]
-        except ValueError:
-            pass
         print(f"  Invalid choice, enter 1-{len(keys)}")
 
 

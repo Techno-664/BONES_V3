@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 from contextlib import nullcontext
 
+import numpy as np
 import torch
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
     LinearLR,
@@ -14,26 +15,26 @@ from torch.optim.lr_scheduler import (
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from bones.cli import resolve_device
+from bones.config import (
+    CATEGORIES,
+    CHECKPOINTS_DIR,
+    FOLDS_DIR,
+    IOU_MATCH_THRESHOLD,
+    MASK_THRESHOLD,
+    N_FOLDS,
+    SCORE_THRESHOLD,
+    TRAIN,
+)
+from bones.data.builders import RepeatDataset, build_concat_dataset, collate_fn
+from bones.logging import setup_logger
+from bones.metrics.matching import compute_class_metrics, derive_class_metrics
+from bones.models.mask_rcnn import build_mask_rcnn
 from bones.transforms.augmentation import (
     AlbumentationsAdapter,
     build_augmentation_pipeline,
     build_val_pipeline,
 )
-from bones.config import (
-    CATEGORIES,
-    CHECKPOINTS_DIR,
-    N_FOLDS,
-    SCORE_THRESHOLD,
-    MASK_THRESHOLD,
-    IOU_MATCH_THRESHOLD,
-    FOLDS_DIR,
-    TRAIN,
-)
-from bones.logging import setup_logger
-from bones.models.mask_rcnn import build_mask_rcnn
-from bones.cli import resolve_device
-from bones.data.builders import RepeatDataset, build_concat_dataset, collate_fn
-from bones.metrics.matching import compute_class_metrics, derive_class_metrics
 
 log = setup_logger("train")
 
@@ -82,7 +83,7 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip=None, scaler=Non
                     if "loss_mask" in loss_dict:
                         loss_dict["loss_mask"] *= avg_weight
 
-        losses = sum(loss for loss in loss_dict.values())
+        losses: torch.Tensor = sum(loss for loss in loss_dict.values())
 
         optimizer.zero_grad()
         if scaler is not None:
@@ -108,9 +109,10 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip=None, scaler=Non
 def validate(model, loader, device):
     total_loss = 0.0
     n = 0
-    cat_id_to_name = CATEGORIES
+    categories = CATEGORIES
     class_ids = sorted(CATEGORIES.keys())
     results = {cid: {"tp": 0, "fp": 0, "fn": 0, "iou_sum": 0.0, "iou_count": 0, "dice_list": []} for cid in class_ids}
+    img_counts = {cid: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for cid in class_ids}
 
     model.eval()
     for images, targets in tqdm(loader, desc="  Val", leave=False):
@@ -120,7 +122,7 @@ def validate(model, loader, device):
         model.train()
         with torch.no_grad():
             loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
+        losses: torch.Tensor = sum(loss for loss in loss_dict.values())
         model.eval()
 
         total_loss += losses.item()
@@ -130,6 +132,19 @@ def validate(model, loader, device):
         target = targets[0]
 
         for cat_id in class_ids:
+            gt_present = bool((target["labels"] == cat_id).any())
+            cid_scores = output["scores"][output["labels"] == cat_id]
+            pred_present = bool(len(cid_scores) > 0 and cid_scores.max().item() > SCORE_THRESHOLD)
+            c = img_counts[cat_id]
+            if gt_present and pred_present:
+                c["tp"] += 1
+            elif gt_present:
+                c["fn"] += 1
+            elif pred_present:
+                c["fp"] += 1
+            else:
+                c["tn"] += 1
+
             gt_idx = (target["labels"] == cat_id).nonzero(as_tuple=True)[0]
             gt_masks = target["masks"][gt_idx]
 
@@ -146,11 +161,42 @@ def validate(model, loader, device):
     metrics_str = f"Val Loss: {avg_loss:.4f}"
     metrics_dict = {"val_loss": avg_loss}
 
+    img_accs = []
+    img_fars = []
+    img_frrs = []
     for cat_id in class_ids:
         r = derive_class_metrics(results[cat_id])
-        name = cat_id_to_name[cat_id]
-        metrics_str += f" | {name}: P={r['precision']:.3f} R={r['recall']:.3f} F1={r['f1']:.3f} IoU={r['mean_iou']:.3f} Dice={r['mean_dice']:.3f}"
+        name = categories[cat_id]
+
+        c = img_counts[cat_id]
+        total = c["tp"] + c["tn"] + c["fp"] + c["fn"]
+        acc = (c["tp"] + c["tn"]) / total if total > 0 else 0.0
+        far = c["fp"] / (c["fp"] + c["tn"]) if (c["fp"] + c["tn"]) > 0 else 0.0
+        frr = c["fn"] / (c["fn"] + c["tp"]) if (c["fn"] + c["tp"]) > 0 else 0.0
+        img_accs.append(acc)
+        img_fars.append(far)
+        img_frrs.append(frr)
+
+        metrics_str += (
+            f" | {name}: P={r['precision']:.3f} R={r['recall']:.3f}"
+            f" F1={r['f1_score']:.3f} IoU={r['mean_iou']:.3f} Dice={r['mean_dice']:.3f}"
+            f" Acc={acc:.3f} FAR={far:.3f} FRR={frr:.3f}"
+        )
         metrics_dict[name] = r
+        metrics_dict[f"{name}_image"] = {
+            "accuracy": round(acc, 4), "far": round(far, 4), "frr": round(frr, 4),
+        }
+
+    if img_accs:
+        macro_acc = float(np.mean(img_accs))
+        macro_far = float(np.mean(img_fars))
+        macro_frr = float(np.mean(img_frrs))
+        metrics_str += (
+            f" | Macro: Acc={macro_acc:.3f} FAR={macro_far:.3f} FRR={macro_frr:.3f}"
+        )
+        metrics_dict["macro_image"] = {
+            "accuracy": round(macro_acc, 4), "far": round(macro_far, 4), "frr": round(macro_frr, 4),
+        }
 
     log.info("  %s", metrics_str)
     return metrics_dict
@@ -161,7 +207,7 @@ def train(
     device_choice: str = "auto",
     fold: int | None = None,
     lr: float | None = None,
-    augmentation_count: int | None = None,
+    augmented_copies_per_image: int = 1,
 ) -> torch.nn.Module:
     device = resolve_device(device_choice)
     log.info("Using device: %s", device)
@@ -171,8 +217,6 @@ def train(
         num_epochs = cfg["epochs"]
     if lr is not None:
         cfg = {**cfg, "lr": lr}
-    if augmentation_count is None:
-        augmentation_count = cfg.get("augmentation_count")
 
     pipeline = build_augmentation_pipeline()
     train_adapter = AlbumentationsAdapter(pipeline)
@@ -188,9 +232,9 @@ def train(
         raise ValueError("No validation samples found")
 
     orig_len = len(train_ds)
-    if augmentation_count is not None and augmentation_count > 1:
-        train_ds = RepeatDataset(train_ds, augmentation_count)
-        log.info("Augmentation multiplier: %d → %d samples/epoch", orig_len, len(train_ds))
+    if augmented_copies_per_image > 1:
+        train_ds = RepeatDataset(train_ds, augmented_copies_per_image)
+        log.info("Augmented copies per image: %d → %d samples/epoch", orig_len, len(train_ds))
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg["batch_size"], shuffle=True,
@@ -212,6 +256,7 @@ def train(
     )
 
     warmup = cfg["warmup_epochs"]
+    warmup_sched = None
     if warmup > 0:
         warmup_sched = LinearLR(optimizer, start_factor=cfg["warmup_start_factor"], total_iters=warmup)
     if cfg.get("scheduler", "cosine") == "step":
@@ -237,12 +282,13 @@ def train(
     best_val_loss = float("inf")
     patience_counter = 0
 
+    assert num_epochs is not None
     for epoch in range(start_epoch, num_epochs):
         log.info("Epoch %d/%d [%d train / %d val]", epoch + 1, num_epochs, len(train_ds), len(val_ds))
 
-        class_wt = model.class_weights.to(device) if model.class_weights is not None else None
+        class_weights = model.class_weights.to(device) if model.class_weights is not None else None
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, device, cfg["grad_clip"], scaler, class_wt
+            model, train_loader, optimizer, device, cfg["grad_clip"], scaler, class_weights
         )
         val_metrics = validate(model, val_loader, device)
         val_loss = val_metrics["val_loss"]
@@ -281,7 +327,7 @@ def train(
 
 
 def main() -> int:
-    from bones.cli import prompt_int, prompt_path, prompt_choice, prompt_float
+    from bones.cli import prompt_choice, prompt_float, prompt_int
 
     epochs = prompt_int("Number of epochs", default=TRAIN["epochs"], min_val=1)
 
@@ -289,7 +335,12 @@ def main() -> int:
 
     lr = prompt_float("Learning rate", default=TRAIN["lr"], min_val=0.00001, max_val=1.0)
 
-    aug_count = prompt_int("Augmentation multiplier (blank = on-the-fly default)", default=None, min_val=1)
+    augmented_copies_raw = prompt_int(
+        "Augmented copies per image (3 = each image appears 3x per epoch"
+        " with different augmentations)",
+        default=TRAIN["augmented_copies_per_image"], min_val=1,
+    )
+    augmented_copies: int = augmented_copies_raw if augmented_copies_raw is not None else 1
 
     device = prompt_choice(
         "Select device:",
@@ -298,12 +349,12 @@ def main() -> int:
     )
 
     if fold is not None:
-        train(epochs, device_choice=device, fold=fold, lr=lr, augmentation_count=aug_count)
+        train(epochs, device_choice=device, fold=fold, lr=lr, augmented_copies_per_image=augmented_copies)
         log.info("Fold %d complete. Best checkpoint: %s", fold, CHECKPOINTS_DIR / f"fold_{fold}" / "best.pth")
     else:
         for k in range(N_FOLDS):
             log.info("=== Fold %d / %d ===", k + 1, N_FOLDS)
-            train(epochs, device_choice=device, fold=k, lr=lr, augmentation_count=aug_count)
+            train(epochs, device_choice=device, fold=k, lr=lr, augmented_copies_per_image=augmented_copies)
             log.info("  Fold %d checkpoint: %s", k, CHECKPOINTS_DIR / f"fold_{k}" / "best.pth")
         log.info("All %d folds complete.", N_FOLDS)
     return 0

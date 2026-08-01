@@ -74,11 +74,10 @@ def compute_class_metrics(
     iou_np = compute_iou_matrix(gt_masks, pred_masks)
     matched_gt, matched_pred, matched_pairs, tp, iou_sum = greedy_iou_match(iou_np, iou_threshold)
 
-    if pred_masks_binary is None:
-        pred_masks_binary = pred_masks
+    pred_binary = pred_masks if pred_masks_binary is None else pred_masks_binary
 
     for gi, pi in matched_pairs:
-        pred_np = pred_masks_binary[pi].cpu().numpy()
+        pred_np = pred_binary[pi].cpu().numpy()
         gt_np = gt_masks[gi].cpu().numpy()
         inter = float((pred_np & gt_np).sum())
         total = float(pred_np.sum()) + float(gt_np.sum())
@@ -95,7 +94,7 @@ def compute_class_metrics(
     return result
 
 
-def derive_class_metrics(counts: dict) -> dict[str, float]:
+def derive_class_metrics(counts: dict[str, Any]) -> dict[str, float]:
     precision = counts["tp"] / (counts["tp"] + counts["fp"]) if (counts["tp"] + counts["fp"]) > 0 else 0.0
     recall = counts["tp"] / (counts["tp"] + counts["fn"]) if (counts["tp"] + counts["fn"]) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
@@ -105,7 +104,7 @@ def derive_class_metrics(counts: dict) -> dict[str, float]:
     return {
         "precision": round(precision, 4),
         "recall": round(recall, 4),
-        "f1": round(f1, 4),
+        "f1_score": round(f1, 4),
         "mean_iou": round(mean_iou, 4),
         "mean_dice": round(mean_dice, 4),
     }

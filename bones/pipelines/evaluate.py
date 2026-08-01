@@ -1,41 +1,42 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from bones.cli import resolve_device
 from bones.config import (
     CATEGORIES,
     CHECKPOINTS_DIR,
     CONF_MAT_IOU_THRESHOLD,
+    FOLDS_DIR,
+    IOU_MATCH_THRESHOLD,
     IOU_THRESHOLDS,
+    MASK_THRESHOLD,
     MODEL,
     N_FOLDS,
     SCORE_THRESHOLD,
-    MASK_THRESHOLD,
-    IOU_MATCH_THRESHOLD,
-    FOLDS_DIR,
     VIS,
 )
+from bones.data.builders import build_concat_dataset, collate_fn
+from bones.logging import setup_logger
 from bones.metrics.analytics import (
-    compute_mAP,
     compute_f1_vs_threshold,
+    compute_map,
     compute_tide_errors,
     confusion_matrix,
-    sensitivity_specificity,
     multiclass_auc_roc,
+    sensitivity_specificity,
 )
-from bones.viz.plots import save_all_figures, plot_cross_fold_metrics
-from bones.models.mask_rcnn import load_checkpoint
-from bones.logging import setup_logger
-from bones.cli import resolve_device
-from bones.data.builders import build_concat_dataset, collate_fn
 from bones.metrics.matching import compute_class_metrics, derive_class_metrics
+from bones.models.mask_rcnn import load_checkpoint
+from bones.transforms.augmentation import AlbumentationsAdapter, build_val_pipeline
+from bones.viz.plots import plot_cross_fold_metrics, save_all_figures
 
 log = setup_logger("evaluate")
 
@@ -48,10 +49,11 @@ def _run_eval(
     device: torch.device,
     save_dir: str | None = None,
 ) -> dict:
-    cat_id_to_name = CATEGORIES
-    class_ids = sorted(CATEGORIES.keys())
+    categories = CATEGORIES
+    class_ids: list[int] = list(CATEGORIES.keys())
+    class_ids.sort()
 
-    results = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0, "total_gt": 0, "total_pred": 0, "iou_sum": 0.0, "iou_count": 0, "dice_list": []})
+    results: dict[str, Any] = {}
     all_gt_masks: list[np.ndarray] = []
     all_gt_labels: list[int] = []
     all_pred_masks: list[np.ndarray] = []
@@ -67,7 +69,8 @@ def _run_eval(
     per_image_errors: list[dict] = []
     viz_on = save_dir is not None
     if viz_on:
-        n_total = len(loader) * loader.batch_size if loader.batch_size else len(loader.dataset)
+        ds_len = getattr(loader.dataset, "__len__", lambda: 0)()
+        n_total = len(loader) * ds_len
         log.info("Storing %d image tensors in memory for overlay generation (~%d × H × W × 3)", n_total, n_total)
 
     if loader.batch_size > 1:
@@ -98,7 +101,13 @@ def _run_eval(
         img_fn = 0
 
         for cat_id in class_ids:
-            cat_name = cat_id_to_name[cat_id]
+            cat_name = categories[cat_id]
+            if cat_name not in results:
+                results[cat_name] = {
+                    "tp": 0, "fp": 0, "fn": 0,
+                    "total_gt": 0, "total_pred": 0,
+                    "iou_sum": 0.0, "iou_count": 0, "dice_list": [],
+                }
 
             gt_idx = (target["labels"] == cat_id).nonzero(as_tuple=True)[0]
             gt_masks = target["masks"][gt_idx]
@@ -132,12 +141,12 @@ def _run_eval(
         if viz_on:
             per_image_errors.append({"fp": img_fp, "fn": img_fn})
 
-    metrics = {}
+    metrics: dict[str, Any] = {}
     for cat_id in class_ids:
-        cat_name = cat_id_to_name[cat_id]
+        cat_name = categories[cat_id]
         counts = results[cat_name]
         r = derive_class_metrics(counts)
-        f1_val = r.pop("f1")
+        f1_val = r.pop("f1_score")
         metrics[cat_name] = {
             **r,
             "f1_score": f1_val,
@@ -145,42 +154,66 @@ def _run_eval(
             "fp": counts["fp"],
             "fn": counts["fn"],
         }
-        log.info("  %s: P=%.4f R=%.4f F1=%.4f mIoU=%.4f Dice=%.4f",
+        log.info("  %s: P=%.4f R=%.4f F1=%.4f Mean IoU=%.4f Dice=%.4f",
                  cat_name, r["precision"], r["recall"], f1_val, r["mean_iou"], r["mean_dice"])
 
+    map_results: dict[str, Any] = {}
     if all_gt_masks:
-        map_results = compute_mAP(all_pred_masks, all_gt_masks, all_pred_scores, all_pred_labels, all_gt_labels, class_ids, IOU_THRESHOLDS, return_details=viz_on)
-        metrics.update(map_results)
+        map_results = compute_map(
+            all_pred_masks, all_gt_masks, all_pred_scores,
+            all_pred_labels, all_gt_labels, class_ids,
+            IOU_THRESHOLDS, return_details=viz_on,
+        )
+        metrics["mAP_50"] = map_results["mAP_50"]
+        metrics["mAP_50_95"] = map_results["mAP_50_95"]
         log.info("  mAP@0.5: %.4f  mAP@0.5:0.95: %.4f", map_results['mAP_50'], map_results['mAP_50_95'])
     else:
-        metrics.update({"mAP_50": 0.0, "mAP_50_95": 0.0})
+        metrics["mAP_50"] = 0.0
+        metrics["mAP_50_95"] = 0.0
 
-    cm = confusion_matrix(all_pred_masks, all_gt_masks, all_pred_labels, all_gt_labels, class_ids, CONF_MAT_IOU_THRESHOLD)
+    cm = confusion_matrix(
+        all_pred_masks, all_gt_masks, all_pred_labels, all_gt_labels,
+        class_ids, CONF_MAT_IOU_THRESHOLD,
+    )
     metrics["confusion_matrix"] = cm
     ss = sensitivity_specificity(cm)
     metrics["sensitivity_specificity"] = ss
 
     for cid in class_ids:
-        key = int(cid)
+        key = str(cid)
         if key in ss:
-            log.info("  %s: Sens=%.4f Spec=%.4f", cat_id_to_name[key], ss[key]['sensitivity'], ss[key]['specificity'])
-    log.info("  Macro: Sens=%.4f Spec=%.4f", ss['macro_avg']['sensitivity'], ss['macro_avg']['specificity'])
-    log.info("  Micro: Sens=%.4f Spec=%.4f", ss['micro_avg']['sensitivity'], ss['micro_avg']['specificity'])
+            log.info("  %s: Sens=%.4f Spec=%.4f Acc=%.4f FAR=%.4f FRR=%.4f",
+                     categories[cid], ss[key]['sensitivity'], ss[key]['specificity'],
+                     ss[key]['accuracy'], ss[key]['far'], ss[key]['frr'])
+    log.info("  Macro: Sens=%.4f Spec=%.4f Acc=%.4f FAR=%.4f FRR=%.4f",
+             ss['macro_avg']['sensitivity'], ss['macro_avg']['specificity'],
+             ss['macro_avg']['accuracy'], ss['macro_avg']['far'], ss['macro_avg']['frr'])
+    log.info("  Micro: Sens=%.4f Spec=%.4f Acc=%.4f FAR=%.4f FRR=%.4f",
+             ss['micro_avg']['sensitivity'], ss['micro_avg']['specificity'],
+             ss['micro_avg']['accuracy'], ss['micro_avg']['far'], ss['micro_avg']['frr'])
 
     if all_image_scores:
-        auc_roc = multiclass_auc_roc(all_image_scores, all_image_labels, class_ids)
+        auc_roc = multiclass_auc_roc(all_image_scores, all_image_labels, class_ids, return_curve=True)
         metrics["auc_roc"] = {str(k): v["auc"] for k, v in auc_roc.items()}
+        metrics["roc_curves"] = auc_roc
         for cid in class_ids:
             auc = auc_roc[cid]["auc"]
-            log.info("  %s: AUC-ROC=%.4f", cat_id_to_name[cid], auc)
+            log.info("  %s: AUC-ROC=%.4f", categories[cid], auc)
 
-    if viz_on:
+    if save_dir is not None:
         eval_data: dict = {}
         if all_gt_masks:
             eval_data["pr_curves"] = map_results.get("pr_curves", {})
             eval_data["per_class_ap"] = map_results.get("per_class_ap", {})
-        eval_data["f1_data"] = compute_f1_vs_threshold(all_pred_masks, all_gt_masks, all_pred_scores, all_pred_labels, all_gt_labels, class_ids, IOU_MATCH_THRESHOLD, VIS.get("f1_threshold_step", 0.05))
-        eval_data["tide_data"] = compute_tide_errors(all_pred_masks, all_gt_masks, all_pred_scores, all_pred_labels, all_gt_labels, class_ids, CONF_MAT_IOU_THRESHOLD)
+        eval_data["f1_data"] = compute_f1_vs_threshold(
+            all_pred_masks, all_gt_masks, all_pred_scores,
+            all_pred_labels, all_gt_labels, class_ids,
+            IOU_MATCH_THRESHOLD, VIS.get("f1_threshold_step", 0.05),
+        )
+        eval_data["tide_data"] = compute_tide_errors(
+            all_pred_masks, all_gt_masks, all_pred_labels,
+            all_gt_labels, class_ids, CONF_MAT_IOU_THRESHOLD,
+        )
         eval_data["matched_ious_per_class"] = {int(k): v for k, v in matched_ious_per_class.items()}
         eval_data["images"] = all_images
         eval_data["targets"] = all_targets
@@ -214,7 +247,11 @@ def evaluate_split(fold: int, checkpoint_path: str, device_choice: str = "auto",
         log.warning("  No images found for %s", split_name)
         return {}
 
-    ds = build_concat_dataset(stems)
+    val_adapter = AlbumentationsAdapter(build_val_pipeline())
+    ds = build_concat_dataset(stems, val_adapter)
+    if ds is None:
+        log.warning("  Dataset is empty for %s", split_name)
+        return {}
     loader = DataLoader(
         ds, batch_size=1, shuffle=False,
         collate_fn=collate_fn, num_workers=0
@@ -224,10 +261,10 @@ def evaluate_split(fold: int, checkpoint_path: str, device_choice: str = "auto",
     return _run_eval(model, loader, f"{split_name} eval", device, save_dir)
 
 
-def _aggregate_metrics(all_metrics: list[dict]) -> dict:
+def _aggregate_metrics(all_metrics: list[dict]) -> dict[str, Any]:
     keys = ["precision", "recall", "f1_score", "mean_iou", "mean_dice"]
-    aggregated = {"n_folds": len(all_metrics)}
-    for cat_name in [v for k, v in CATEGORIES.items()]:
+    aggregated: dict[str, Any] = {"n_folds": len(all_metrics)}
+    for cat_name in list(CATEGORIES.values()):
         vals = {k: [] for k in keys}
         for m in all_metrics:
             if cat_name in m:
@@ -243,11 +280,17 @@ def _aggregate_metrics(all_metrics: list[dict]) -> dict:
 
 
 def main() -> int:
-    from bones.cli import prompt_int, prompt_path, prompt_choice, prompt_float, prompt_bool
+    from bones.cli import (
+        prompt_bool,
+        prompt_choice,
+        prompt_float,
+        prompt_int,
+        prompt_path,
+    )
 
     all_folds = prompt_bool("Evaluate all 5 folds?", default=False)
 
-    nms = prompt_float("NMS IoU threshold", default=MODEL["nms_thresh"], min_val=0.0, max_val=1.0)
+    nms = prompt_float("NMS IoU threshold", default=MODEL["nms_threshold"], min_val=0.0, max_val=1.0)
 
     device = prompt_choice(
         "Select device:",
@@ -278,10 +321,14 @@ def main() -> int:
                 plot_cross_fold_metrics(all_metrics, str(Path(fig_dir) / "cross_fold_metrics.png"),
                                         [CATEGORIES[cid] for cid in sorted(CATEGORIES.keys())])
     else:
-        fold = prompt_int("Fold index (0-4)", default=0, min_val=0, max_val=N_FOLDS - 1)
+        fold_raw = prompt_int("Fold index (0-4)", default=0, min_val=0, max_val=N_FOLDS - 1)
+        if fold_raw is None:
+            log.error("No fold selected")
+            return 1
+        fold: int = fold_raw
         default_ckpt = str(CHECKPOINTS_DIR / f"fold_{fold}" / "best.pth")
         ckpt = prompt_path("Checkpoint path (leave blank for default)", default=default_ckpt, must_exist=True)
-        if not Path(str(ckpt)).exists():
+        if ckpt is None or not Path(str(ckpt)).exists():
             log.error("Checkpoint not found: %s", ckpt)
             return 1
         save_dir = str(CHECKPOINTS_DIR / f"fold_{fold}" / "figures") if gen_figures else None

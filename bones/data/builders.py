@@ -1,31 +1,31 @@
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
+from typing import Any
 
-import torch
-from torch.utils.data import ConcatDataset
+from torch.utils.data import ConcatDataset, Dataset
+
+from bones.config import DATASET_DIR, TREATMENTS, WEEKS
+from bones.data.dataset import FilteredBonesDataset
 
 
-class RepeatDataset(torch.utils.data.Dataset):
-    def __init__(self, base, n):
+class RepeatDataset(Dataset):
+    def __init__(self, base: Any, n: int):
         self.base = base
         self.n = n
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.base) * self.n
 
-    def __getitem__(self, idx):
-        return self.base[idx % len(self.base)]
-
-from bones.config import DATASET_DIR, WEEKS, TREATMENTS
-from bones.data.dataset import FilteredBonesDataset
+    def __getitem__(self, index: int) -> Any:
+        return self.base[index % len(self.base)]
 
 
 def stem_prefix(week: str, treatment: str) -> str:
     return f"W{week.split('_')[1].zfill(2)}_{treatment}"
 
 
-def collate_fn(batch):
+def collate_fn(batch: list[Any]) -> tuple[Any, ...]:
     return tuple(zip(*batch))
 
 

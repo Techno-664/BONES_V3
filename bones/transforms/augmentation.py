@@ -99,8 +99,7 @@ def build_augmentation_pipeline() -> A.Compose:
 
     return A.Compose(
         [
-            A.SmallestMaxSize(max_size=cfg["resize_short"], interpolation=cv2.INTER_NEAREST),
-            A.LongestMaxSize(max_size=cfg["resize_max"], interpolation=cv2.INTER_NEAREST),
+            A.Resize(height=cfg["resize_height"], width=cfg["resize_width"], interpolation=cv2.INTER_NEAREST),
             A.OneOf(
                 [
                     A.Affine(
@@ -161,8 +160,7 @@ def build_val_pipeline() -> A.Compose:
     cfg = AUGMENTATION
     return A.Compose(
         [
-            A.SmallestMaxSize(max_size=cfg["resize_short"], interpolation=cv2.INTER_NEAREST),
-            A.LongestMaxSize(max_size=cfg["resize_max"], interpolation=cv2.INTER_NEAREST),
+            A.Resize(height=cfg["resize_height"], width=cfg["resize_width"], interpolation=cv2.INTER_NEAREST),
         ],
         bbox_params=A.BboxParams(format="coco", label_fields=["category_ids"]),
     )
