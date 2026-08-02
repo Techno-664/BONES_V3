@@ -20,15 +20,12 @@ from bones.config import (
     CATEGORIES,
     CHECKPOINTS_DIR,
     FOLDS_DIR,
-    IOU_MATCH_THRESHOLD,
-    MASK_THRESHOLD,
     N_FOLDS,
     SCORE_THRESHOLD,
     TRAIN,
 )
 from bones.data.builders import RepeatDataset, build_concat_dataset, collate_fn
 from bones.logging import setup_logger
-from bones.metrics.matching import compute_class_metrics, derive_class_metrics
 from bones.models.mask_rcnn import build_mask_rcnn
 from bones.transforms.augmentation import (
     AlbumentationsAdapter,
@@ -60,9 +57,26 @@ def load_datasets(fold: int | None = None, train_transforms=None, val_transforms
     return train_ds, val_ds
 
 
+def _batch_accuracy(model, images, targets) -> float:
+    class_ids = sorted(CATEGORIES.keys())
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        preds = model(images)
+    for pred, target in zip(preds, targets):
+        for cid in class_ids:
+            gt_present = bool((target["labels"] == cid).any())
+            cid_scores = pred["scores"][pred["labels"] == cid]
+            pred_present = bool(len(cid_scores) > 0 and cid_scores.max().item() > SCORE_THRESHOLD)
+            correct += int(gt_present == pred_present)
+            total += 1
+    return correct / total if total > 0 else 0.0
+
+
 def train_one_epoch(model, loader, optimizer, device, grad_clip=None, scaler=None, class_weights=None):
     model.train()
     total_loss = 0.0
+    total_acc = 0.0
     amp_ctx = autocast() if device.type == "cuda" else nullcontext()
 
     pbar = tqdm(loader, desc="  Train", leave=False)
@@ -99,19 +113,19 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip=None, scaler=Non
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
+        acc = _batch_accuracy(model, images, targets)
         total_loss += losses.item()
-        pbar.set_postfix(Loss=f"{losses.item():.4f}")
+        total_acc += acc
+        pbar.set_postfix(acc=f"{acc:.4f}", loss=f"{losses.item():.4f}")
 
-    return total_loss / len(loader)
+    return total_loss / len(loader), total_acc / len(loader)
 
 
 @torch.no_grad()
 def validate(model, loader, device):
     total_loss = 0.0
     n = 0
-    categories = CATEGORIES
     class_ids = sorted(CATEGORIES.keys())
-    results = {cid: {"tp": 0, "fp": 0, "fn": 0, "iou_sum": 0.0, "iou_count": 0, "dice_list": []} for cid in class_ids}
     img_counts = {cid: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for cid in class_ids}
 
     model.eval()
@@ -145,61 +159,16 @@ def validate(model, loader, device):
             else:
                 c["tn"] += 1
 
-            gt_idx = (target["labels"] == cat_id).nonzero(as_tuple=True)[0]
-            gt_masks = target["masks"][gt_idx]
-
-            score_ok = output["scores"] > 0.0
-            pred_idx = ((output["labels"] == cat_id) & score_ok).nonzero(as_tuple=True)[0]
-            pred_masks = (output["masks"][pred_idx, 0] > MASK_THRESHOLD).to(torch.uint8)
-
-            r = compute_class_metrics(gt_masks, pred_masks, pred_masks, iou_threshold=IOU_MATCH_THRESHOLD)
-            for key in ("tp", "fp", "fn", "iou_sum", "iou_count"):
-                results[cat_id][key] += r[key]
-            results[cat_id]["dice_list"].extend(r["dice_list"])
-
     avg_loss = total_loss / n if n > 0 else 0.0
-    metrics_str = f"Val Loss: {avg_loss:.4f}"
-    metrics_dict = {"val_loss": avg_loss}
 
-    img_accs = []
-    img_fars = []
-    img_frrs = []
+    accs = []
     for cat_id in class_ids:
-        r = derive_class_metrics(results[cat_id])
-        name = categories[cat_id]
-
         c = img_counts[cat_id]
         total = c["tp"] + c["tn"] + c["fp"] + c["fn"]
-        acc = (c["tp"] + c["tn"]) / total if total > 0 else 0.0
-        far = c["fp"] / (c["fp"] + c["tn"]) if (c["fp"] + c["tn"]) > 0 else 0.0
-        frr = c["fn"] / (c["fn"] + c["tp"]) if (c["fn"] + c["tp"]) > 0 else 0.0
-        img_accs.append(acc)
-        img_fars.append(far)
-        img_frrs.append(frr)
+        accs.append((c["tp"] + c["tn"]) / total if total > 0 else 0.0)
+    val_acc = float(np.mean(accs)) if accs else 0.0
 
-        metrics_str += (
-            f" | {name}: P={r['precision']:.3f} R={r['recall']:.3f}"
-            f" F1={r['f1_score']:.3f} IoU={r['mean_iou']:.3f} Dice={r['mean_dice']:.3f}"
-            f" Acc={acc:.3f} FAR={far:.3f} FRR={frr:.3f}"
-        )
-        metrics_dict[name] = r
-        metrics_dict[f"{name}_image"] = {
-            "accuracy": round(acc, 4), "far": round(far, 4), "frr": round(frr, 4),
-        }
-
-    if img_accs:
-        macro_acc = float(np.mean(img_accs))
-        macro_far = float(np.mean(img_fars))
-        macro_frr = float(np.mean(img_frrs))
-        metrics_str += (
-            f" | Macro: Acc={macro_acc:.3f} FAR={macro_far:.3f} FRR={macro_frr:.3f}"
-        )
-        metrics_dict["macro_image"] = {
-            "accuracy": round(macro_acc, 4), "far": round(macro_far, 4), "frr": round(macro_frr, 4),
-        }
-
-    log.info("  %s", metrics_str)
-    return metrics_dict
+    return {"val_loss": avg_loss, "val_accuracy": val_acc}
 
 
 def train(
@@ -279,23 +248,29 @@ def train(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     start_epoch = 0
-    best_val_loss = float("inf")
+    best_val_accuracy = 0.0
     patience_counter = 0
 
     assert num_epochs is not None
     for epoch in range(start_epoch, num_epochs):
-        log.info("Epoch %d/%d [%d train / %d val]", epoch + 1, num_epochs, len(train_ds), len(val_ds))
+        log.info("Epoch %d/%d", epoch + 1, num_epochs)
 
         class_weights = model.class_weights.to(device) if model.class_weights is not None else None
-        train_loss = train_one_epoch(
+        train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, device, cfg["grad_clip"], scaler, class_weights
         )
         val_metrics = validate(model, val_loader, device)
         val_loss = val_metrics["val_loss"]
+        val_acc = val_metrics["val_accuracy"]
         scheduler.step()
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        log.info("  accuracy: %.4f - loss: %.4f - val_accuracy: %.4f - val_loss: %.4f",
+                 train_acc, train_loss, val_acc, val_loss)
+
+        if val_acc > best_val_accuracy:
+            log.info("  val_accuracy improved from %.4f to %.4f, saving model to %s",
+                     best_val_accuracy, val_acc, ckpt_dir / "best.pth")
+            best_val_accuracy = val_acc
             checkpoint = {
                 "epoch": epoch,
                 "model": model.state_dict(),
@@ -303,12 +278,13 @@ def train(
                 "scheduler": scheduler.state_dict(),
                 "train_loss": train_loss,
                 "val_loss": val_loss,
-                "best_val_loss": best_val_loss,
+                "val_accuracy": val_acc,
+                "best_val_accuracy": best_val_accuracy,
             }
             torch.save(checkpoint, ckpt_dir / "best.pth")
             patience_counter = 0
-            log.info("  New best val loss: %.4f", val_loss)
         else:
+            log.info("  val_accuracy did not improve from %.4f", best_val_accuracy)
             patience_counter += 1
             if patience_counter >= cfg["early_stop_patience"]:
                 log.info("  Early stopping at epoch %d", epoch + 1)
@@ -316,7 +292,7 @@ def train(
 
         log.info("")
 
-    log.info("Training complete. Best val loss: %.4f", best_val_loss)
+    log.info("Training complete. Best val accuracy: %.4f", best_val_accuracy)
 
     best_path = ckpt_dir / "best.pth"
     if best_path.exists():
