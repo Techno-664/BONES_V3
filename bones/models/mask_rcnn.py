@@ -8,6 +8,24 @@ from torchvision.models.detection import (
 )
 
 from bones.config import MODEL
+from bones.logging import setup_logger
+
+log = setup_logger("mask_rcnn")
+
+
+def maybe_compile(model: torch.nn.Module) -> torch.nn.Module:
+    if not MODEL.get("compile", True):
+        return model
+    if not torch.cuda.is_available():
+        log.info("torch.compile skipped: CUDA not available")
+        return model
+    try:
+        compiled = torch.compile(model)
+        log.info("Model compiled with torch.compile")
+        return compiled
+    except Exception as e:  # noqa: BLE001
+        log.warning("torch.compile failed (%s); using uncompiled model", e)
+        return model
 
 
 def load_checkpoint(
@@ -21,7 +39,7 @@ def load_checkpoint(
     if nms_threshold is not None:
         model.roi_heads.nms_thresh = nms_threshold
     model.eval()
-    return model
+    return maybe_compile(model)
 
 
 def build_mask_rcnn(num_classes: int | None = None, class_weights: list[float] | None = None) -> torch.nn.Module:

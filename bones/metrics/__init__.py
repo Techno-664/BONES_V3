@@ -1,6 +1,6 @@
 from bones.metrics.analytics import (
+    compute_coco_map,
     compute_f1_vs_threshold,
-    compute_map,
     compute_tide_errors,
     confusion_matrix,
     multiclass_auc_roc,
@@ -20,9 +20,9 @@ from bones.metrics.matching import (
 __all__ = [
     "callus_ratio",
     "compute_class_metrics",
+    "compute_coco_map",
     "compute_f1_vs_threshold",
     "compute_iou_matrix",
-    "compute_map",
     "compute_measurements",
     "compute_tide_errors",
     "confusion_matrix",

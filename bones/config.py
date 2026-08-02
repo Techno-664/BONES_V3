@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import numpy as np
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DATASET_DIR = PROJECT_ROOT / "DATASET"
@@ -39,22 +37,10 @@ MODEL = {
     "num_classes": NUM_CLASSES,
     "pretrained": True,
     "nms_threshold": 0.5,
-}
-
-ANALYTICS = {
-    "mAP_iou_start": 0.5,
-    "mAP_iou_end": 0.95,
-    "mAP_iou_steps": 10,
+    "compile": True,
 }
 
 CONF_MAT_IOU_THRESHOLD = 0.5
-
-IOU_THRESHOLDS = [
-    round(x, 2)
-    for x in np.linspace(
-        ANALYTICS["mAP_iou_start"], ANALYTICS["mAP_iou_end"], ANALYTICS["mAP_iou_steps"]
-    )
-]
 
 VIS = {
     "save_overlays": True,

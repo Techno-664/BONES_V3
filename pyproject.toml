@@ -14,5 +14,7 @@ dependencies = [
     "numpy",
     "opencv-python",
     "pillow",
+    "tensorboard",
+    "pycocotools",
     "scipy-stubs~=1.18.0",
 ]

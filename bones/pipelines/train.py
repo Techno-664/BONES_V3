@@ -13,6 +13,7 @@ from torch.optim.lr_scheduler import (
     StepLR,
 )
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from bones.cli import resolve_device
@@ -26,7 +27,7 @@ from bones.config import (
 )
 from bones.data.builders import RepeatDataset, build_concat_dataset, collate_fn
 from bones.logging import setup_logger
-from bones.models.mask_rcnn import build_mask_rcnn
+from bones.models.mask_rcnn import build_mask_rcnn, maybe_compile
 from bones.transforms.augmentation import (
     AlbumentationsAdapter,
     build_augmentation_pipeline,
@@ -217,6 +218,7 @@ def train(
     log.info("%d train / %d val", len(train_ds), len(val_ds))
 
     model = build_mask_rcnn(class_weights=cfg.get("class_weights")).to(device)
+    model = maybe_compile(model)
 
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(
@@ -247,6 +249,8 @@ def train(
         ckpt_dir = CHECKPOINTS_DIR
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    writer = SummaryWriter(log_dir=str(ckpt_dir / "tensorboard"))
+
     start_epoch = 0
     best_val_accuracy = 0.0
     patience_counter = 0
@@ -266,6 +270,11 @@ def train(
 
         log.info("  accuracy: %.4f - loss: %.4f - val_accuracy: %.4f - val_loss: %.4f",
                  train_acc, train_loss, val_acc, val_loss)
+
+        writer.add_scalar("train/accuracy", train_acc, epoch)
+        writer.add_scalar("train/loss", train_loss, epoch)
+        writer.add_scalar("val/accuracy", val_acc, epoch)
+        writer.add_scalar("val/loss", val_loss, epoch)
 
         if val_acc > best_val_accuracy:
             log.info("  val_accuracy improved from %.4f to %.4f, saving model to %s",
@@ -293,6 +302,18 @@ def train(
         log.info("")
 
     log.info("Training complete. Best val accuracy: %.4f", best_val_accuracy)
+
+    writer.add_hparams(
+        {
+            "lr": cfg["lr"],
+            "epochs": num_epochs,
+            "batch_size": cfg["batch_size"],
+            "augmented_copies": cfg["augmented_copies_per_image"],
+            "fold": fold if fold is not None else -1,
+        },
+        {"best_val_accuracy": best_val_accuracy},
+    )
+    writer.close()
 
     best_path = ckpt_dir / "best.pth"
     if best_path.exists():

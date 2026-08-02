@@ -16,7 +16,6 @@ from bones.config import (
     CONF_MAT_IOU_THRESHOLD,
     FOLDS_DIR,
     IOU_MATCH_THRESHOLD,
-    IOU_THRESHOLDS,
     MASK_THRESHOLD,
     MODEL,
     N_FOLDS,
@@ -26,8 +25,8 @@ from bones.config import (
 from bones.data.builders import build_concat_dataset, collate_fn
 from bones.logging import setup_logger
 from bones.metrics.analytics import (
+    compute_coco_map,
     compute_f1_vs_threshold,
-    compute_map,
     compute_tide_errors,
     confusion_matrix,
     multiclass_auc_roc,
@@ -61,6 +60,8 @@ def _run_eval(
     all_pred_scores: list[float] = []
     all_image_scores: list[dict[int, float]] = []
     all_image_labels: list[dict[int, int]] = []
+    per_image_gt: list[list[tuple[np.ndarray, int]]] = []
+    per_image_dt: list[list[tuple[np.ndarray, int, float]]] = []
 
     matched_ious_per_class: dict[int, list[float]] = {cid: [] for cid in class_ids}
     all_images: list = []
@@ -99,6 +100,8 @@ def _run_eval(
 
         img_fp = 0
         img_fn = 0
+        gt_instances: list[tuple[np.ndarray, int]] = []
+        dt_instances: list[tuple[np.ndarray, int, float]] = []
 
         for cat_id in class_ids:
             cat_name = categories[cat_id]
@@ -133,10 +136,15 @@ def _run_eval(
             for j in range(n_gt):
                 all_gt_masks.append(gt_masks[j].cpu().numpy())
                 all_gt_labels.append(cat_id)
+                gt_instances.append((gt_masks[j].cpu().numpy(), cat_id))
             for j in range(n_pred):
                 all_pred_masks.append(pred_masks_tensor[j].cpu().numpy())
                 all_pred_labels.append(cat_id)
                 all_pred_scores.append(float(output["scores"][pred_idx[j]].item()))
+                dt_instances.append((pred_masks_tensor[j].cpu().numpy(), cat_id, float(output["scores"][pred_idx[j]].item())))
+
+        per_image_gt.append(gt_instances)
+        per_image_dt.append(dt_instances)
 
         if viz_on:
             per_image_errors.append({"fp": img_fp, "fn": img_fn})
@@ -159,14 +167,13 @@ def _run_eval(
 
     map_results: dict[str, Any] = {}
     if all_gt_masks:
-        map_results = compute_map(
-            all_pred_masks, all_gt_masks, all_pred_scores,
-            all_pred_labels, all_gt_labels, class_ids,
-            IOU_THRESHOLDS, return_details=viz_on,
+        map_results = compute_coco_map(
+            per_image_gt, per_image_dt, class_ids, return_details=viz_on,
         )
         metrics["mAP_50"] = map_results["mAP_50"]
         metrics["mAP_50_95"] = map_results["mAP_50_95"]
-        log.info("  mAP@0.5: %.4f  mAP@0.5:0.95: %.4f", map_results['mAP_50'], map_results['mAP_50_95'])
+        log.info("  mAP@0.5: %.4f  mAP@0.5:0.95: %.4f (pycocotools COCOeval)",
+                 map_results['mAP_50'], map_results['mAP_50_95'])
     else:
         metrics["mAP_50"] = 0.0
         metrics["mAP_50_95"] = 0.0

@@ -54,102 +54,121 @@ def _greedy_match(
     return pairs
 
 
-def compute_ap(recall: np.ndarray, precision: np.ndarray) -> float:
-    recall = np.concatenate([[0.0], recall, [1.0]])
-    precision = np.concatenate([[0.0], precision, [0.0]])
-    for i in range(len(precision) - 2, -1, -1):
-        precision[i] = max(precision[i], precision[i + 1])
-    idx = np.where(recall[1:] != recall[:-1])[0]
-    if len(idx) == 0:
-        return 0.0
-    return float(((recall[idx + 1] - recall[idx]) * precision[idx + 1]).sum())
+def _rle_encode(mask: np.ndarray) -> dict:
+    from pycocotools import mask as mask_utils
+    return mask_utils.encode(np.asfortranarray(np.ascontiguousarray(mask, dtype=np.uint8)))
 
 
-def compute_map(
-    pred_masks: list[np.ndarray],
-    gt_masks: list[np.ndarray],
-    pred_scores: list[float],
-    pred_labels: list[int],
-    gt_labels: list[int],
+def compute_coco_map(
+    per_image_gt: list[list[tuple[np.ndarray, int]]],
+    per_image_dt: list[list[tuple[np.ndarray, int, float]]],
     class_ids: list[int],
-    iou_thresholds: list[float] | None = None,
     return_details: bool = False,
 ) -> dict[str, Any]:
-    if iou_thresholds is None:
-        iou_thresholds = [round(0.5 + 0.05 * i, 2) for i in range(10)]
+    """COCO-style mAP via pycocotools COCOeval (iouType='segm').
 
-    n_gt = len(gt_masks)
-    n_pred = len(pred_masks)
-    result: dict[str, Any]
-    if n_gt == 0 or n_pred == 0:
-        result = {"mAP_50": 0.0, "mAP_50_95": 0.0}
-        if return_details:
-            result["per_class_ap"] = {}
-            result["pr_curves"] = {}
+    per_image_gt: per image, list of (binary mask, category_id)
+    per_image_dt: per image, list of (binary mask, category_id, score)
+    """
+    from pycocotools import mask as mask_utils
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+
+    n_gt = sum(len(g) for g in per_image_gt)
+    n_dt = sum(len(d) for d in per_image_dt)
+
+    result: dict[str, Any] = {"mAP_50": 0.0, "mAP_50_95": 0.0}
+    if return_details:
+        result["per_class_ap"] = {}
+        result["pr_curves"] = {}
+    if n_gt == 0 or n_dt == 0:
         return result
 
-    iou_matrix = _iou_matrix_from_lists(gt_masks, pred_masks)
+    images = []
+    gt_anns = []
+    dt_anns = []
+    ann_id = 1
 
-    aps: list[float] = []
-    per_class_ap: dict[int, dict[str, float]] = {cid: {"AP_50": 0.0, "AP_50_95": 0.0} for cid in class_ids}
-    pr_curves: dict[int, dict[str, Any]] = {}
+    for i, (gt_list, dt_list) in enumerate(zip(per_image_gt, per_image_dt)):
+        if not gt_list and not dt_list:
+            continue
+        h, w = gt_list[0][0].shape if gt_list else dt_list[0][0].shape
+        img_id = i + 1
+        images.append({"id": img_id, "width": int(w), "height": int(h)})
 
-    for iou_threshold in iou_thresholds:
-        class_aps = []
-        for cid in class_ids:
-            gt_idx = [i for i, l in enumerate(gt_labels) if l == cid]
-            pred_idx = [j for j, l in enumerate(pred_labels) if l == cid]
-            if not gt_idx:
-                continue
-            if not pred_idx:
-                class_aps.append(0.0)
-                if iou_threshold == iou_thresholds[0]:
-                    per_class_ap[cid]["AP_50"] = 0.0
-                continue
+        for mask, cat in gt_list:
+            rle = _rle_encode(mask)
+            gt_anns.append({
+                "id": ann_id, "image_id": img_id, "category_id": int(cat),
+                "segmentation": rle, "area": float(mask_utils.area(rle)),
+                "bbox": [float(v) for v in mask_utils.toBbox(rle)], "iscrowd": 0,
+            })
+            ann_id += 1
 
-            matches = iou_matrix[np.ix_(gt_idx, pred_idx)] >= iou_threshold
-            gt_matched = np.zeros(len(gt_idx), dtype=bool)
-            pred_matched = np.zeros(len(pred_idx), dtype=bool)
+        for mask, cat, score in dt_list:
+            rle = _rle_encode(mask)
+            dt_anns.append({
+                "id": ann_id, "image_id": img_id, "category_id": int(cat),
+                "segmentation": rle, "area": float(mask_utils.area(rle)),
+                "bbox": [float(v) for v in mask_utils.toBbox(rle)], "score": float(score),
+            })
+            ann_id += 1
 
-            scores = np.array([pred_scores[j] for j in pred_idx])
-            sort_order = np.argsort(-scores)
+    categories = [{"id": int(c), "name": str(int(c))} for c in class_ids]
 
-            tp = np.zeros(len(pred_idx), dtype=bool)
-            fp = np.zeros(len(pred_idx), dtype=bool)
+    coco_gt = COCO()
+    coco_gt.dataset = {"images": images, "annotations": gt_anns, "categories": categories}
+    coco_gt.createIndex()
+    coco_dt = coco_gt.loadRes(dt_anns)
 
-            for rank, pi in enumerate(sort_order):
-                candidates = np.where(matches[:, pi] & ~gt_matched)[0]
-                if len(candidates) > 0:
-                    gt_matched[candidates[0]] = True
-                    pred_matched[pi] = True
-                    tp[rank] = True
-                else:
-                    fp[rank] = True
+    coco_eval = COCOeval(coco_gt, coco_dt, "segm")
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    precision_arr = coco_eval.eval["precision"]  # (T, R, K, A, M)
 
-            cum_tp = np.cumsum(tp).astype(float)
-            cum_fp = np.cumsum(fp).astype(float)
-            precision = cum_tp / np.maximum(cum_tp + cum_fp, 1e-8)
-            recall = cum_tp / len(gt_idx)
-            ap = compute_ap(recall, precision)
-            class_aps.append(ap)
+    def _ap(iou_thr: float | None, class_idx: int | None = None) -> float:
+        s = precision_arr
+        if iou_thr is not None:
+            t = np.where(np.isclose(coco_eval.params.iouThrs, iou_thr))[0]
+            s = s[t]
+        if class_idx is not None:
+            s = s[:, :, [class_idx]]
+        s = s[:, :, :, 0, -1]  # area 'all', maxDets last
+        vals = s[s > -1]
+        return float(np.mean(vals)) if len(vals) > 0 else 0.0
 
-            if return_details and iou_threshold == iou_thresholds[0]:
-                per_class_ap[cid]["AP_50"] = round(ap, 4)
-                pr_curves[cid] = {
-                    "precision": [round(float(p), 4) for p in precision],
-                    "recall": [round(float(r), 4) for r in recall],
-                    "scores": [round(float(s), 4) for s in scores[sort_order]],
-                }
+    result = {
+        "mAP_50": round(_ap(0.5), 4),
+        "mAP_50_95": round(_ap(None), 4),
+    }
 
-        if class_aps:
-            aps.append(float(np.mean(class_aps)))
-
-    map_50 = aps[0] if len(aps) > 0 else 0.0
-    map_50_95 = float(np.mean(aps)) if aps else 0.0
-    result = {"mAP_50": round(map_50, 4), "mAP_50_95": round(map_50_95, 4)}
     if return_details:
+        rec_thrs = coco_eval.params.recThrs
+        area_idx = 0
+        max_dets_idx = len(coco_eval.params.maxDets) - 1
+        per_class_ap: dict[int, dict[str, float]] = {}
+        pr_curves: dict[int, dict[str, Any]] = {}
+
+        for k, cid in enumerate(class_ids):
+            ap_50 = _ap(0.5, k)
+            ap_50_95 = _ap(None, k)
+            per_class_ap[cid] = {
+                "AP_50": round(ap_50, 4),
+                "AP_50_95": round(ap_50_95, 4),
+            }
+
+            p_curve = precision_arr[0, :, k, area_idx, max_dets_idx]
+            if np.all(p_curve < 0):
+                continue
+            pr_curves[cid] = {
+                "precision": [round(float(v), 4) for v in p_curve],
+                "recall": [round(float(r), 4) for r in rec_thrs],
+                "AP_50": round(ap_50, 4),
+            }
+
         result["per_class_ap"] = per_class_ap
         result["pr_curves"] = pr_curves
+
     return result
 
 
