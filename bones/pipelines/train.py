@@ -62,8 +62,14 @@ def _batch_accuracy(model, images, targets) -> float:
     class_ids = sorted(CATEGORIES.keys())
     correct = 0
     total = 0
-    with torch.no_grad():
-        preds = model(images)
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            preds = model(images)
+    finally:
+        if was_training:
+            model.train()
     for pred, target in zip(preds, targets):
         for cid in class_ids:
             gt_present = bool((target["labels"] == cid).any())
