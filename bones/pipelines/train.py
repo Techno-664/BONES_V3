@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import nullcontext
 
 import numpy as np
@@ -330,7 +331,14 @@ def train(
 
 
 def main() -> int:
-    from bones.cli import prompt_choice, prompt_float, prompt_int
+    from bones.cli import prompt_bool, prompt_choice, prompt_float, prompt_int
+
+    if not prompt_bool(
+        "Enable torch.compile? (choose no on Colab to avoid dynamo recompilation"
+        " overhead, yes elsewhere for speed)",
+        default=True,
+    ):
+        os.environ["BONES_COMPILE"] = "0"
 
     epochs = prompt_int("Number of epochs", default=TRAIN["epochs"], min_val=1)
 

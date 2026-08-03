@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 from torchvision.models.detection import (
     faster_rcnn,
@@ -13,8 +15,19 @@ from bones.logging import setup_logger
 log = setup_logger("mask_rcnn")
 
 
+def compile_enabled() -> tuple[bool, str]:
+    env = os.environ.get("BONES_COMPILE")
+    if env is not None:
+        value = env.strip().lower() not in ("0", "false", "no", "off")
+        return value, f"BONES_COMPILE={env}"
+    value = bool(MODEL.get("compile", True))
+    return value, f"config MODEL['compile']={value}"
+
+
 def maybe_compile(model: torch.nn.Module) -> torch.nn.Module:
-    if not MODEL.get("compile", True):
+    enabled, source = compile_enabled()
+    if not enabled:
+        log.info("torch.compile skipped (%s = False)", source)
         return model
     if not torch.cuda.is_available():
         log.info("torch.compile skipped: CUDA not available")
