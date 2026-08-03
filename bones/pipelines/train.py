@@ -334,8 +334,7 @@ def main() -> int:
     from bones.cli import prompt_bool, prompt_choice, prompt_float, prompt_int
 
     if not prompt_bool(
-        "Enable torch.compile? (choose no on Colab to avoid dynamo recompilation"
-        " overhead, yes elsewhere for speed)",
+        "Enable torch.compile? (no on Colab: avoids recompilation overhead)",
         default=True,
     ):
         os.environ["BONES_COMPILE"] = "0"
