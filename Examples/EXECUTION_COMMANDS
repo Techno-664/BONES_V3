@@ -1,5 +1,6 @@
-uv sync
-python -m bones generate_splits
-python -m bones train
-python -m bones evaluate
-python -m bones predict
+uv sync                                # install deps (tensorboard, pycocotools)
+python -m bones generate_splits        # stratified 5-fold splits
+python -m bones train                  # train (TensorBoard logs per fold)
+tensorboard --logdir CHECKPOINTS       # view training curves (new tab/terminal)
+python -m bones evaluate               # full metrics incl. pycocotools mAP + figures
+python -m bones predict                # single image → overlay + predictions.json + measurements
